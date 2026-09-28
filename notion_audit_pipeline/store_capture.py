@@ -1,34 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-store_capture.py — 门店侧「自动抓流 → 切片 → 上传 Notion」无人值守代理。
+store_capture.py — 门店侧「FTP 拉取视频 → 切片 → 上传 Notion」无人值守代理。
 
-【职责边界】本脚本**只做抓流、切片、上传**，不进行任何 AI 推理（无 CV/VLM/MLX/ultralytics 依赖）。
+【职责边界】本脚本**只做 FTP 拉取、切片、上传**，不进行任何 AI 推理（无 CV/VLM/MLX/ultralytics 依赖）。
 所有人数计数、在场时段、语义描述等稽核都在总部 process_pending.py 完成。门店机只需能装 ffmpeg + Python。
 
-场景：门店摄像头是大华(Dahua) RTSP 流，工作人员不会手动下载视频。
-本脚本部署在门店局域网内的一台机器（Mac Mini / 工控机 / 店员电脑）上常驻运行：
-  1) 按 cameras.json 连接各摄像头子码流（subtype=1，低码率分析副本）；
-  2) 用 ffmpeg（-c copy 免转码，首选）或 OpenCV（无 ffmpeg 时兜底重编码）
-     把视频流切成固定时长的片段(clip)，落在本机 staging 目录；
+场景：门店录像机/监控平台把录像文件暴露为 FTP 目录（设备端 FTP 推送或共享目录均可），
+工作人员不会手动下载视频。本脚本部署在门店局域网内的一台机器上常驻运行：
+  1) 按 cameras.json 的 ftp_* 配置，周期性连接 FTP，把远程目录中新增的视频文件拉取到本机；
+  2) 用 ffmpeg（-c copy 免转码，首选）把大文件切成固定时长的片段(clip)，落在本机 staging 目录；
   3) 监听切片产出，把“已写完”的片段自动上传到 Notion「视频台账库」(建待处理记录)；
   4) HQ 侧 process_pending.py 继续轮询/下载/跑 CV·VLM/回写报告页（已有，不动）。
 
 特点：
-  - 无人值守：无人工下载；营业时段门控可选；断流自动重连/重启。
-  - 两种抓流后端：ffmpeg(首选, 免转码) / opencv(无 ffmpeg 时兜底, 会重编码)。
+  - 无人值守：无人工下载；FTP 断线自动重连；拉取幂等（远程文件切完移入 processed/ 防重复）。
+  - 切片方式：ffmpeg -c copy 免转码（首选）；无 ffmpeg 时整文件作为单片段上传（由上传前归一化兜底）。
   - 幂等：已上传片段记入本地 .capture_state.json，守护进程重启不会重复上传。
   - dry-run：只切片+打印将要上传什么，不真正调 Notion，便于无凭证验证。
 
 用法：
   python store_capture.py                          # 常驻守护（按 cameras.json）
   python store_capture.py --once --run-seconds 3600# 跑 1 小时就停
-  python store_capture.py --dry-run                # 不调 Notion，仅验证切片+上传逻辑
-  python store_capture.py --backend opencv         # 强制 OpenCV 后端（无 ffmpeg 时）
+  python store_capture.py --dry-run                # 不调 Notion，仅验证拉取+切片+上传逻辑
+  python store_capture.py --list                   # 打印解析后的 FTP 拉取计划后退出
   python store_capture.py --config my_cameras.json # 指定配置
 """
 import os
 import sys
 import re
+import glob
 import json
 import time
 import shutil
@@ -48,9 +48,9 @@ STATE_FILE = os.path.join(HERE, ".capture_state.json")
 STOP = threading.Event()
 DONE = {}            # cam_key -> [已上传文件名]，持久化到 STATE_FILE
 LAST_SIZE = {}       # 片段路径 -> 上次扫描字节数（判断“写完”）
-ALIVE = {}           # cam_key -> 抓流进程/线程是否存活
-ACTIVE = {}          # cam_key -> 当前正在写入的片段路径（opencv 用；ffmpeg 用 mtime 推断）
 CFG = {}
+
+VIDEO_EXTS = (".mp4", ".dav", ".avi", ".mkv", ".ts", ".mov", ".m4v", ".flv")
 
 
 def log(*a):
@@ -75,138 +75,182 @@ def save_state():
     json.dump(DONE, open(STATE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
 
-def in_business(hours):
-    if not hours:
-        return True
-    try:
-        s = datetime.strptime(hours[0], "%H:%M").time()
-        e = datetime.strptime(hours[1], "%H:%M").time()
-    except Exception:
-        return True
-    now = datetime.now().time()
-    return s <= now <= e
+def is_video_name(name):
+    """判断远程/本地文件名是否为可拉取、可切片的视频文件。"""
+    return (name.lower().endswith(VIDEO_EXTS)
+            and not name.startswith(".")
+            and name != "processed")
 
 
-# ----------------------------- 抓流后端 -----------------------------
+def parse_time_from_name(name):
+    """从文件名里提取 14 位时间戳（YYYYMMDDHHMMSS），取不到返回 None。
+    用于给切片片段标注真实录像起止时间（录像机类设备命名常带时间戳）。"""
+    m = re.search(r"(\d{14})", name)
+    if m:
+        try:
+            datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
+            return m.group(1)
+        except Exception:
+            return None
+    return None
+
+
+# ----------------------------- FTP 拉取 -----------------------------
+def ftp_pull_loop(cam, rawdir, cam_key):
+    """常驻：连接录像机/监控平台 FTP，把远程目录新增的视频文件拉取到本地 raw 目录。
+    断线自动重连；同名文件跳过；下载中断残留的 .part 会被清理重下。"""
+    while not STOP.is_set():
+        try:
+            import ftplib
+            host = cam["ftp_host"]
+            user = cam.get("ftp_user", "")
+            pwd = cam.get("ftp_password", "")
+            port = int(cam.get("ftp_port", 21))
+            rdir = cam.get("ftp_remote_dir", "/")
+            ftp = ftplib.FTP()
+            ftp.connect(host, port, timeout=30)
+            ftp.login(user, pwd)
+            ftp.cwd(rdir)
+            names = []
+            ftp.retrlines("NLST", names.append)
+            for n in names:
+                if not is_video_name(n):
+                    continue
+                local = os.path.join(rawdir, n)
+                if os.path.exists(local):
+                    continue
+                tmp = local + ".part"
+                try:
+                    with open(tmp, "wb") as f:
+                        ftp.retrbinary("RETR " + n, f.write)
+                    os.replace(tmp, local)
+                    log(f"[ftp:{cam_key}] 已拉取: {n}")
+                except Exception as e:
+                    log(f"[ftp:{cam_key}] 下载失败 {n}: {e}")
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
+            ftp.quit()
+        except Exception as e:
+            log(f"[ftp:{cam_key}] 连接异常，稍后重试: {e}")
+        if STOP.is_set():
+            break
+        time.sleep(cam.get("ftp_poll_sec", CFG.get("ftp_poll_sec", 120)))
+
+
+# ----------------------------- 本地切片 -----------------------------
 def ffmpeg_available():
     return shutil.which("ffmpeg") is not None
 
 
-def build_ffmpeg_cmd(cam, camdir):
-    """ffmpeg 免转码切片：直读大华子码流(subtype=1)，-c copy 不重编码，
-    用 segment muxer 按 segment_seconds 切出以起始时间命名的 mp4。"""
+def slice_local(path, camdir, cam, cam_key):
+    """把单个已拉取的大文件切成 segment_seconds 片段。
+    优先 -c copy 免转码；失败则回退 libx264 重编码。
+    片段命名带起止时间戳（与上传/水印还原兼容）：{起}_{止}.mp4。
+    返回切出的片段数（0 表示失败/无产出）。"""
     seg = int(cam.get("segment_seconds", CFG.get("segment_seconds", 1800)))
-    url = cam["rtsp_url"]
-    extra = cam.get("ffmpeg_extra", "")
-    out = os.path.join(camdir, "%Y%m%d_%H%M%S.mp4")
-    cmd = ["ffmpeg", "-y", "-loglevel", "error",
-           "-rtsp_transport", "tcp",
-           "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
-           "-i", url,
-           "-c", "copy",
-           "-f", "segment", "-segment_time", str(seg),
-           "-reset_timestamps", "1", "-strftime", "1", out]
-    if extra:
-        # 允许在 rtsp_url 之后插入额外参数（如 "-use_wallclock_as_timestamps 1"）
-        # 简单做法：把 extra 拼到 -i 之前
-        cmd[5:5] = extra.split()
-    return cmd
-
-
-def capture_ffmpeg(cam, camdir, cam_key):
-    """常驻：ffmpeg 进程退出就重启（断流自愈）。"""
-    while not STOP.is_set():
-        if not in_business(cam.get("business_hours")):
-            time.sleep(30)
-            continue
-        cmd = build_ffmpeg_cmd(cam, camdir)
-        log(f"[ffmpeg:{cam_key}] 启动抓流:", cam["rtsp_url"])
+    start_ts = parse_time_from_name(os.path.basename(path))
+    tmp_tpl = os.path.join(camdir, "_slice_%04d.mp4")
+    cmds = [
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", path,
+         "-c", "copy", "-f", "segment", "-segment_time", str(seg),
+         "-reset_timestamps", "1", tmp_tpl],
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", path,
+         "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+         "-f", "segment", "-segment_time", str(seg),
+         "-reset_timestamps", "1", tmp_tpl],
+    ]
+    ok = False
+    for cmd in cmds:
         try:
-            p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            ALIVE[cam_key] = True
-            p.wait()
-            ALIVE[cam_key] = False
-        except Exception as e:
-            ALIVE[cam_key] = False
-            log(f"[ffmpeg:{cam_key}] 启动失败: {e}")
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           check=True, timeout=3600)
+            ok = True
+            break
+        except Exception:
+            continue
+    if not ok:
+        log(f"[slice:{cam_key}] 切片失败: {os.path.basename(path)}")
+        return 0
+    pieces = sorted(glob.glob(os.path.join(camdir, "_slice_*.mp4")))
+    if not pieces:
+        log(f"[slice:{cam_key}] 无产出，跳过: {os.path.basename(path)}")
+        return 0
+    base = datetime.strptime(start_ts, "%Y%m%d%H%M%S") if start_ts else datetime.now()
+    for i, p in enumerate(pieces):
+        s = base + timedelta(seconds=seg * i)
+        e = s + timedelta(seconds=seg)
+        dst = os.path.join(camdir,
+                           f"{s.strftime('%Y%m%d%H%M%S')}_{e.strftime('%Y%m%d%H%M%S')}.mp4")
+        if os.path.exists(dst):
+            os.remove(p)
+            continue
+        os.rename(p, dst)
+    return len(pieces)
+
+
+def slice_loop(cam, rawdir, camdir, cam_key):
+    """常驻：扫描 raw 目录中已拉取完成的文件，切成片段放入 camdir 供 watcher 上传。
+    切完的源文件移入 rawdir/processed/ 防重复处理；
+    无 ffmpeg 时整文件改名 .mp4 直接移入 camdir 作为单片段。"""
+    while not STOP.is_set():
+        if os.path.isdir(rawdir):
+            try:
+                files = [f for f in os.listdir(rawdir)
+                         if is_video_name(f) and os.path.isfile(os.path.join(rawdir, f))]
+            except Exception:
+                files = []
+            for f in sorted(files):
+                p = os.path.join(rawdir, f)
+                try:
+                    mt = os.path.getmtime(p)
+                except Exception:
+                    continue
+                # 等待文件写稳定（FTP 下载完成后再处理）
+                if time.time() - mt < CFG.get("stable_sec", 60):
+                    continue
+                if not ffmpeg_available():
+                    base = f if f.lower().endswith(".mp4") else os.path.splitext(f)[0] + ".mp4"
+                    dst = os.path.join(camdir, base)
+                    if not os.path.exists(dst):
+                        try:
+                            shutil.move(p, dst)
+                            log(f"[slice:{cam_key}] 无 ffmpeg，整文件作为单片段: {base}")
+                        except Exception as e:
+                            log(f"[slice:{cam_key}] 移动失败 {f}: {e}")
+                    else:
+                        try:
+                            os.remove(p)
+                        except Exception:
+                            pass
+                    continue
+                n = slice_local(p, camdir, cam, cam_key)
+                if n:
+                    archived = os.path.join(rawdir, "processed")
+                    os.makedirs(archived, exist_ok=True)
+                    try:
+                        shutil.move(p, os.path.join(archived, f))
+                        log(f"[slice:{cam_key}] {f} 已切 {n} 段并归档")
+                    except Exception as e:
+                        log(f"[slice:{cam_key}] 源文件归档失败（稍后重扫）: {e}")
         if STOP.is_set():
             break
-        log(f"[ffmpeg:{cam_key}] 进程退出，5s 后重启")
-        time.sleep(5)
-
-
-def capture_opencv(cam, camdir, cam_key):
-    """兜底：用 OpenCV 读 RTSP/文件，按 segment_seconds 重编码切片（无需 ffmpeg）。
-    注意：这是纯“读帧→写文件”的封装/转码，不做任何目标检测或 AI 推理。"""
-    import cv2
-    seg = int(cam.get("segment_seconds", CFG.get("segment_seconds", 1800)))
-    cap = cv2.VideoCapture(cam["rtsp_url"])
-    if not cap.isOpened():
-        log(f"[opencv:{cam_key}] 无法打开: {cam['rtsp_url']}")
-        return
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = None
-    frames = 0
-    seq = 0
-    active_path = None
-    ALIVE[cam_key] = True
-    try:
-        while not STOP.is_set():
-            if not in_business(cam.get("business_hours")):
-                time.sleep(30)
-                continue
-            ret, frame = cap.read()
-            if not ret:
-                time.sleep(1)
-                continue
-            if writer is None:
-                start = datetime.now()
-                end = start + timedelta(seconds=seg)
-                # 加序列号后缀，避免高速回放/同秒内切段导致文件名碰撞互相覆盖
-                name = f"{start.strftime('%Y%m%d%H%M%S')}_{end.strftime('%Y%m%d%H%M%S')}_s{seq}.mp4"
-                seq += 1
-                active_path = os.path.join(camdir, name)
-                ACTIVE[cam_key] = active_path
-                writer = cv2.VideoWriter(active_path, fourcc, fps, (w, h))
-            writer.write(frame)
-            frames += 1
-            if frames >= int(seg * fps):
-                writer.release()
-                writer = None
-                frames = 0
-                active_path = None
-                ACTIVE[cam_key] = None
-    finally:
-        if writer:
-            writer.release()
-        cap.release()
-        ALIVE[cam_key] = False
-        ACTIVE[cam_key] = None
+        time.sleep(CFG.get("poll_sec", 30))
 
 
 # ----------------------------- 片段监听/上传 -----------------------------
 def upload_if_done(cam, camdir, cam_key):
     if not os.path.isdir(camdir):
         return
-    alive = ALIVE.get(cam_key, False)
     done_set = set(DONE.get(cam_key, []))
     try:
         files = [f for f in os.listdir(camdir)
-                 if f.endswith(".mp4") and f not in done_set]
+                 if f.endswith(".mp4") and not f.startswith("_") and f not in done_set]
     except Exception:
         return
     if not files:
         return
-    # 当前正在写入的片段：opencv 后端看 ACTIVE（writer 当前打开的文件）；
-    # ffmpeg 后端看 mtime 最新者（segment muxer 同一时刻只持有一个打开文件）。
-    if CFG.get("backend") == "opencv":
-        active_path = ACTIVE.get(cam_key)
-    else:
-        active_path = os.path.join(
-            camdir, max(files, key=lambda f: os.path.getmtime(os.path.join(camdir, f))))
     for f in files:
         p = os.path.join(camdir, f)
         try:
@@ -217,20 +261,19 @@ def upload_if_done(cam, camdir, cam_key):
         stable = (time.time() - mt) > CFG.get("stable_sec", 60)
         size_unchanged = (LAST_SIZE.get(p) == sz)
         LAST_SIZE[p] = sz
-        is_active = (p == active_path)
-        # 已完成条件：写完(stable) 且 大小不再变 且 (不是活跃片段 或 抓流已死)
-        if stable and size_unchanged and (not is_active or not alive):
+        # 已完成条件：写完(stable) 且 大小不再变（连续两轮扫描确认）
+        if stable and size_unchanged:
             upload_one(cam, camdir, cam_key, p, f)
 
 
 def ensure_two_timestamps(path, cam):
-    """ffmpeg -strftime 文件名只带起始时间戳；HQ 侧依赖“起止”两个 14 位时间戳还原水印时间，
-    故片段写完补上结束时间戳（start+segment_seconds）再上传。opencv 片段已自带，无需处理。"""
+    """兼容旧逻辑：若片段只有起始时间戳，补上结束时间戳（start+segment_seconds）再上传。
+    当前 FTP 切片产物已自带“起止”两个 14 位时间戳，本函数会直接返回原路径。"""
     d = os.path.dirname(path)
     base = os.path.basename(path)
     m = re.match(r"^(\d{14})\.mp4$", base)
     if not m:
-        return path  # 已有起止时间戳（如 *_sN.mp4）
+        return path  # 已有起止时间戳
     seg = int(cam.get("segment_seconds", CFG.get("segment_seconds", 1800)))
     try:
         start = datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
@@ -312,7 +355,7 @@ def normalize_clip_for_upload(path, cam):
 
 def upload_one(cam, camdir, cam_key, path, fn):
     uploaded_dir = os.path.join(camdir, "uploaded")
-    # ffmpeg 片段补结束时间戳（不影响 opencv 片段）
+    # 片段若只有起始时间戳则补结束时间戳（FTP 切片产物已自带，通常跳过）
     path = ensure_two_timestamps(path, cam)
     fn = os.path.basename(path)
     # 格式兜底：确保出口为 mp4(H.264)，避免总部 AI 无法解码
@@ -345,30 +388,18 @@ def watcher_loop():
 
 
 # ----------------------------- 主流程 -----------------------------
-def resolve_backend(preferred):
-    if preferred == "opencv":
-        return "opencv"
-    if preferred == "ffmpeg":
-        if ffmpeg_available():
-            return "ffmpeg"
-        log("未检测到 ffmpeg，回退到 opencv 后端")
-        return "opencv"
-    # auto
-    return "ffmpeg" if ffmpeg_available() else "opencv"
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=DEFAULT_CONFIG)
-    ap.add_argument("--backend", default="auto", choices=["auto", "ffmpeg", "opencv"])
     ap.add_argument("--once", action="store_true", help="跑 run-seconds 秒后停")
     ap.add_argument("--run-seconds", type=int, default=3600)
-    ap.add_argument("--dry-run", action="store_true", help="不调 Notion，仅验证切片+上传逻辑")
-    ap.add_argument("--list", action="store_true", help="打印解析后的抓流计划后退出")
+    ap.add_argument("--dry-run", action="store_true", help="不调 Notion，仅验证拉取+切片+上传逻辑")
+    ap.add_argument("--list", action="store_true", help="打印解析后的 FTP 拉取计划后退出")
     a = ap.parse_args()
 
     if not os.path.exists(a.config):
-        log(f"找不到配置文件: {a.config}"); sys.exit(2)
+        log(f"找不到配置文件: {a.config}")
+        sys.exit(2)
     glo = json.load(open(a.config, encoding="utf-8"))
     CFG.update(glo)
     CFG["dry_run"] = a.dry_run
@@ -376,18 +407,18 @@ def main():
     CFG.setdefault("segment_seconds", 1800)
     CFG.setdefault("stable_sec", 60)
     CFG.setdefault("poll_sec", 30)
+    CFG.setdefault("ftp_poll_sec", 120)
     CFG["cameras"] = glo.get("cameras", [])
     load_state()
 
-    backend = resolve_backend(a.backend)
-    CFG["backend"] = backend
-    log(f"后端={backend}  片段时长={CFG['segment_seconds']}s  staging={CFG['staging_dir']}"
+    log(f"FTP 拉取模式  片段时长={CFG['segment_seconds']}s  staging={CFG['staging_dir']}"
         f"  dry_run={a.dry_run}")
 
     if a.list:
         for cam in CFG["cameras"]:
-            log(f"  - {cam['store']} / {cam['camera']}  {cam['rtsp_url']}  "
-                f"营业={cam.get('business_hours','全天')}")
+            log(f"  - {cam['store']} / {cam['camera']}  "
+                f"ftp://{cam.get('ftp_user', '')}@{cam['ftp_host']}:{cam.get('ftp_port', 21)}"
+                f"{cam.get('ftp_remote_dir', '/')}")
         return
 
     os.makedirs(CFG["staging_dir"], exist_ok=True)
@@ -395,13 +426,14 @@ def main():
     for cam in CFG["cameras"]:
         cam_key = f"{slug(cam['store'])}__{slug(cam['camera'])}"
         camdir = os.path.join(CFG["staging_dir"], cam_key)
+        rawdir = os.path.join(camdir, "raw")
         os.makedirs(camdir, exist_ok=True)
-        if backend == "ffmpeg":
-            t = threading.Thread(target=capture_ffmpeg, args=(cam, camdir, cam_key), daemon=True)
-        else:
-            t = threading.Thread(target=capture_opencv, args=(cam, camdir, cam_key), daemon=True)
-        t.start()
-        threads.append(t)
+        os.makedirs(rawdir, exist_ok=True)
+        t1 = threading.Thread(target=ftp_pull_loop, args=(cam, rawdir, cam_key), daemon=True)
+        t2 = threading.Thread(target=slice_loop, args=(cam, rawdir, camdir, cam_key), daemon=True)
+        t1.start()
+        t2.start()
+        threads += [t1, t2]
 
     wt = threading.Thread(target=watcher_loop, daemon=True)
     wt.start()
@@ -415,7 +447,7 @@ def main():
             while not STOP.is_set():
                 time.sleep(1)
     except KeyboardInterrupt:
-        log("收到中断，停止抓流...")
+        log("收到中断，停止拉取...")
     finally:
         STOP.set()
         for t in threads:
