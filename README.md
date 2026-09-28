@@ -15,7 +15,7 @@ video-audit-ai/
 │   ├── build_report.py        # 稽核报告生成
 │   └── process_*.sh           # 批量处理脚本
 └── notion_audit_pipeline/     # Notion 视频台账流水线
-    ├── store_capture.py       # 门店侧抓流 + 切片 + 上传
+    ├── store_capture.py       # 门店侧 FTP 拉取 + 切片 + 上传
     ├── process_pending.py     # 待处理视频 → 本地稽核
     ├── notion_client.py       # Notion API 封装
     └── config.py              # 全局配置（敏感信息走环境变量）
@@ -24,7 +24,7 @@ video-audit-ai/
 ## 流水线概览
 
 ```
-门店摄像头 RTSP 抓流切片
+门店摄像头 FTP 拉取视频切片
         ↓
 上传视频到 Notion 台账库（视频本体 + 元数据）
         ↓
@@ -43,7 +43,7 @@ export NOTION_VIDEO_DB_ID=...           # 视频台账库 ID
 export NOTION_REPORT_DB_ID=...          # 报告库 ID
 ```
 
-`notion_audit_pipeline/cameras.json` 中 RTSP 地址为脱敏占位示例，部署时替换为真实摄像头地址。
+`notion_audit_pipeline/cameras.json` 中 FTP 地址与密码为脱敏占位示例，部署时替换为真实录像机 FTP 配置。
 
 ## 依赖
 
